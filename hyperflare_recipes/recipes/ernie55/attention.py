@@ -1196,6 +1196,9 @@ class PreparedDSAAttention:
                     head_weight_scale=64**-0.5 if self.use_flashindexer else None,
                     hadamard=True,
                     key_power_of_two=True,
+                    # On SM120/SM121 (99 KiB max SMEM), DSAFusedIndexerKernel with 64 heads + topk=2048
+                    # allocates 106 KiB SMEM; paged_tiled fits cleanly and already serves B>=8.
+                    route="paged_tiled" if mode != "prefill" else "auto",
                     prefill_records_per_call=32768,
                     examples=examples,
                     example_role=f"attention.dsa_indexer_{idx_heads}",

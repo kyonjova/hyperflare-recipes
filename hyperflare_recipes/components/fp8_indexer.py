@@ -166,7 +166,7 @@ class PreparedFP8Indexer:
 
     def __init__(self, query, weights, cache, pages, lengths, active, output, *,
                  mode, session, name, workspace, buffers=None, prefill_records_per_call=None, topk=512, scores=None,
-                 head_weight_scale=None, hadamard=True, key_power_of_two=True, examples=None, example_role=None):
+                 head_weight_scale=None, hadamard=True, key_power_of_two=True, route="auto", examples=None, example_role=None):
         if type(hadamard) is not bool or type(key_power_of_two) is not bool:
             raise ValueError("FP8 Hadamard and key power-of-two declarations must be booleans")
         if head_weight_scale is not None and (type(head_weight_scale) not in (int, float)
@@ -206,7 +206,7 @@ class PreparedFP8Indexer:
         self.packed_pages = (pages if mode == "prefill" or (pages.is_contiguous() and pages.dtype == torch.int32)
                              else zeros("packed_pages", pages.shape, torch.int32))
         caps = dsa_indexer.Caps(device=query.device, num_q_heads=heads, max_q_rows=rows,
-            max_page_table_width=pages.shape[1], topk=topk, mode=mode,
+            max_page_table_width=pages.shape[1], topk=topk, mode=mode, route=route,
             supertile_k=(min(prefill_records_per_call, pages.shape[1] * 64)
                          if mode == "prefill" and prefill_records_per_call is not None else 0))
         self.selection = PreparedSparseIndexer(self.quantized, self.scaled_weights, cache,
