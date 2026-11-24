@@ -455,13 +455,17 @@ class PreparedLayer:
                 activation="situ",
                 activation_mode="auto",
             ).functional(session=session)
-            att1_plans = ffn0_plans = (
-                self.ffn_hc.plan,
-                self.dense_mlp.up_projection.plan,
-                self.dense_mlp.activation_plan,
-                self.dense_mlp.down_projection.plan,
+            att1_plans = ffn0_plans = tuple(
+                p
+                for p in (
+                    getattr(self.ffn_hc, "plan", None),
+                    self.dense_mlp.up_projection.plan,
+                    self.dense_mlp.activation_plan,
+                    self.dense_mlp.down_projection.plan,
+                )
+                if p is not None
             )
-            ffn1_plans = (self.ffn_hc.plan,)
+            ffn1_plans = tuple(p for p in (getattr(self.ffn_hc, "plan", None),) if p is not None)
             if self.pipelined:
                 self.mlp_reduce_0 = PreparedAllReduce(
                     dense_s.output,
