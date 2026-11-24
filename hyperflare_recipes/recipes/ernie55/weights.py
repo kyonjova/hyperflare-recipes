@@ -440,9 +440,9 @@ class Ernie55WeightLoader(BlockFP8WeightLoader):
         latent_interval = shard.partition(latent_size, alignment=128)
         shared_interval = shard.partition(text["moe_intermediate_size"], alignment=128)
 
-        # Split-feature router: stack gate.weight ([512, 2048]) and gate.weight_1 ([512, 2048]).
-        w0 = self.load_tensor(moe + ".gate.weight", temporary=True)
-        w1 = self.load_tensor(moe + ".gate.weight_1", temporary=True)
+        # Fused split-feature router: stack gate.weight ([512, 4096]) and gate.weight_1 ([512, 4096]) in FP32.
+        w0 = self.load_tensor(moe + ".gate.weight", dtype=torch.float32, temporary=True)
+        w1 = self.load_tensor(moe + ".gate.weight_1", dtype=torch.float32, temporary=True)
         router = persistent_cat((w0, w1), dim=0)
         correction = self.load_tensor(moe + ".e_score_correction_bias", dtype=torch.float32)
         routed_scaling = self.load_tensor(moe + ".gate.routed_scaling_factor_param", dtype=torch.float32)

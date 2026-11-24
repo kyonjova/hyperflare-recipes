@@ -213,23 +213,13 @@ class PreparedLatentMoE:
         self.latent_start, self.latent_end = shard.partition(2048, alignment=128)
         self.latent_width = self.latent_end - self.latent_start
 
-        # Split-feature router projections on x[:, :2048] and x[:, 2048:] -> concatenated [T, 1024] FP32.
-        num_experts = weights.router.shape[0] // 2
-        self.router_w0 = weights.router[:num_experts]
-        self.router_w1 = weights.router[num_experts:]
-        self.router_proj0 = UnquantizedProjection(
-            source[:, :2048].contiguous(),
-            self.router_w0,
-            scratch.router_logits[:, :num_experts].contiguous(),
+        # Fused split-feature router: two [E, H] routers stacked as [2*E, H] FP32 -> [T, 2*E] FP32.
+        self.router_proj = UnquantizedProjection(
+            source,
+            weights.router,
+            scratch.router_logits,
             session=session,
-            name=name + ".router0",
-        ).functional(session=session)
-        self.router_proj1 = UnquantizedProjection(
-            source[:, 2048:].contiguous(),
-            self.router_w1,
-            scratch.router_logits[:, num_experts:].contiguous(),
-            session=session,
-            name=name + ".router1",
+            name=name + ".router",
         ).functional(session=session)
 
         self.fc1_latent = QuantizedProjection(
@@ -296,9 +286,7 @@ class PreparedLatentMoE:
         ).functional(session=session)
 
     def __call__(self, source: torch.Tensor, metadata) -> torch.Tensor:
-        l0 = self.router_proj0(source[:, :2048].contiguous())
-        l1 = self.router_proj1(source[:, 2048:].contiguous())
-        logits = torch.cat((l0, l1), dim=-1)
+        logits = self.router_proj(source)
         routes = ernie55_route_topk(
             logits,
             self.weights.correction,
