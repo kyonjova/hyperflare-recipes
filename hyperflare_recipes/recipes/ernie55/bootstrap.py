@@ -436,6 +436,7 @@ def prepare_rank(snapshot, config: PreparationConfig, *, rank, group, progress=N
         force_moe_decode_a16=config.force_moe_decode_a16,
         expert_scale_compression=config.expert_scale_compression,
         enable_flashindexer=config.enable_flashindexer,
+        group=group,
     )
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache

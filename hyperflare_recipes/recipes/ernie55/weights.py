@@ -149,6 +149,7 @@ class ModelWeights:
         force_moe_decode_a16=False,
         expert_scale_compression="csf",
         enable_flashindexer=True,
+        group=None,
     ):
         from hyperflare_recipes.components.vocabulary import nvfp4_draft_head
 
@@ -163,6 +164,7 @@ class ModelWeights:
             force_moe_decode_a16=force_moe_decode_a16,
             expert_scale_compression=expert_scale_compression,
             enable_flashindexer=enable_flashindexer,
+            group=group,
         ) as loader:
             embedding, norm = loader.load_tensors(("model.embed_tokens.weight", "model.norm.weight"))
             head = loader.load_tensor(
@@ -201,14 +203,31 @@ class ModelWeights:
         )
 
 
-def _load_flashindexer_tensors(snapshot: Path, device) -> dict[str, torch.Tensor]:
-    """Load optional `flashindexer/flashindexer.safetensors` gates if present in snapshot."""
-    path = Path(snapshot) / "flashindexer" / "flashindexer.safetensors"
-    if not path.is_file():
-        return {}
-    from safetensors.torch import load_file
+def _load_flashindexer_tensors(
+    snapshot: Path, device, *, rank: int = 0, group=None
+) -> dict[str, torch.Tensor]:
+    """Load optional `flashindexer/flashindexer.safetensors` gates, broadcast from rank 0.
 
-    raw = load_file(str(path), device="cpu")
+    Multi-host `ignition join` ranks only receive `config.json` and the main weight
+    index locally; broadcasting the ~3 MiB auxiliary safetensors blob from rank 0
+    keeps FlashIndexer head-selection weights and graph structure identical on every rank.
+    """
+    raw_bytes: bytes | None = None
+    if rank == 0:
+        path = Path(snapshot) / "flashindexer" / "flashindexer.safetensors"
+        if path.is_file():
+            raw_bytes = path.read_bytes()
+    if group is not None:
+        import torch.distributed as dist
+
+        payload = [raw_bytes]
+        dist.broadcast_object_list(payload, src=dist.get_global_rank(group, 0), group=group)
+        raw_bytes = payload[0]
+    if raw_bytes is None:
+        return {}
+    from safetensors.torch import load as load_safetensors_bytes
+
+    raw = load_safetensors_bytes(raw_bytes)
     result = {}
     for key, tensor in raw.items():
         if key.endswith("flashindexer_bias"):
@@ -233,6 +252,7 @@ class Ernie55WeightLoader(BlockFP8WeightLoader):
         force_moe_decode_a16=False,
         expert_scale_compression="csf",
         enable_flashindexer=True,
+        group=None,
     ):
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
         self.config = ModelConfig.load(manifest.metadata_path)
@@ -243,7 +263,9 @@ class Ernie55WeightLoader(BlockFP8WeightLoader):
         self.enable_flashindexer = bool(enable_flashindexer)
         self.scale_scratch = None
         self._flashindexer = (
-            _load_flashindexer_tensors(manifest.metadata_path, device)
+            _load_flashindexer_tensors(
+                manifest.metadata_path, device, rank=shard.rank, group=group
+            )
             if self.enable_flashindexer
             else {}
         )
