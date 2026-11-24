@@ -390,6 +390,43 @@ class PreparedDecoder:
             session=session,
             name=name + ".norm",
         ).functional()
+        self.scoring = (
+            None
+            if scoring is None
+            else scoring.prepare(
+                scratch.embedding,
+                weights.head,
+                vocabulary=VOCABULARY,
+                session=session,
+                coordinator=coordinator,
+                name=name + ".prompt",
+            )
+        )
+        self.score_collapse = (
+            None
+            if self.scoring is None
+            else PreparedMHCHead(
+                scratch.residual,
+                weights.head_mix,
+                scratch.embedding,
+                rms_eps=weights.config.text["rms_norm_eps"],
+                hc_eps=weights.config.text["hc_eps"],
+                session=session,
+                name=name + ".prompt_collapse",
+            ).functional()
+        )
+        self.score_norm = (
+            None
+            if self.scoring is None
+            else PreparedRMSNorm(
+                scratch.embedding,
+                weights.norm,
+                scratch.embedding,
+                eps=weights.config.text["rms_norm_eps"],
+                session=session,
+                name=name + ".prompt_norm",
+            ).functional()
+        )
         self.head = PreparedVocabularyProjection(
             scratch.hidden,
             weights.head,
@@ -402,6 +439,9 @@ class PreparedDecoder:
             workspace=workspace,
         ).functional(session=session)
         self.indices.functional()
+
+    def release_outputs(self):
+        self.scratch = self.auxiliary = None
 
     def __call__(self, metadata):
         embedding = self.embedding(
@@ -421,20 +461,15 @@ class PreparedDecoder:
                 feedback_state = self.feedback(feedback_state, result, aux_col)
                 aux_col += 4096
             incoming = result if isinstance(result, tuple) else (result,)
+        residual = result
+        hidden = self.norm(self.collapse(residual[metadata.sample_indices]))
         if self.scoring is not None:
-            head_hidden = self.collapse(result)
-            normalized = self.norm(head_hidden)
-            sampled_hidden = normalized[metadata.sample_indices]
-            logits = self.head(sampled_hidden)
-            apply_multimax(logits, self.weights.multimax_ranges, self.weights.multimax_ts)
-            auxiliary = None if feedback_state is None else feedback_state[0]
-            return logits, sampled_hidden, records, auxiliary, normalized
-        head_hidden = self.collapse(result[metadata.sample_indices])
-        normalized = self.norm(head_hidden)
-        logits = self.head(normalized)
-        apply_multimax(logits, self.weights.multimax_ranges, self.weights.multimax_ts)
+            self.scoring(self.score_norm(self.score_collapse(residual)))
+        logits = apply_multimax(
+            self.head(hidden), self.weights.multimax_ranges, self.weights.multimax_ts
+        )
         auxiliary = None if feedback_state is None else feedback_state[0]
-        return logits, normalized, records, auxiliary
+        return hidden, logits, auxiliary, tuple(records)
 
     def commit(self, counts, records, metadata):
         for layer, layer_records in zip(self.layers, records, strict=True):
