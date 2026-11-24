@@ -426,3 +426,62 @@ def test_chat_template_segmented_output_and_special_isolation():
     assert '<invoke name="get_weather"><parameter name="a">Paris</parameter><parameter name="z">1</parameter></invoke>\n' in text_tools
     assert "<|ernie:im_start|>tool\n<ernie:tool_output>20C</ernie:tool_output>\n<ernie:tool_output>25C</ernie:tool_output><|ernie:im_end|>" in text_tools
     assert len(marks_tools) == 4
+
+
+def test_csf_scale_scratch_and_vha_tp_mix_and_sparse_mla_import():
+    from hyperflare_recipes.recipes.ernie55.attention import (
+        PreparedSparseMLA,
+        PreparedVHAPostMix,
+    )
+    from hyperflare_recipes.recipes.ernie55.weights import Ernie55WeightLoader
+
+    assert PreparedSparseMLA is not None
+
+    loader = Ernie55WeightLoader.__new__(Ernie55WeightLoader)
+    loader.device = torch.device("cpu")
+    loader.scale_scratch = None
+    loader.expert_scale_compression = None
+    assert loader._expert_scale_scratch(512, 2048, 1024) is None
+
+    loader.expert_scale_compression = "csf"
+    first = loader._expert_scale_scratch(512, 2048, 1024)
+    second = loader._expert_scale_scratch(512, 2048, 1024)
+    assert first is second
+    assert isinstance(first, tuple) and len(first) == 2
+    assert first[0].shape == (512, 2048, 64) and first[0].dtype == torch.uint8 and first[0].is_contiguous()
+    assert first[1].shape == (512, 2048, 32) and first[1].dtype == torch.uint8 and first[1].is_contiguous()
+    assert first[0].untyped_storage().data_ptr() != first[1].untyped_storage().data_ptr()
+
+    # Verify TP=2 VHA FP32 -> BF16 pair gather -> FP32 sum matches full-head reference.
+    gen = torch.Generator().manual_seed(29)
+    rows, heads, rank, head_dim = 4, 64, 16, 64
+    u_full = torch.randn(heads, rank, generator=gen, dtype=torch.bfloat16)
+    v_full = torch.randn(heads, rank, generator=gen, dtype=torch.bfloat16)
+    o_full = torch.randn(rows, heads, head_dim, generator=gen, dtype=torch.bfloat16)
+    z_ref = torch.bmm(u_full.float().t().expand(rows, -1, -1), o_full.float())
+    out_ref = (o_full.float() + torch.bmm(v_full.float().expand(rows, -1, -1), z_ref)).to(torch.bfloat16)
+
+    half = heads // 2
+    mix0 = PreparedVHAPostMix(
+        u_full[:half], v_full[:half], tokens=rows, head_dim=head_dim, world=1,
+        gather_runtime=None, coordinator=None, session=None, name="vha0",
+    )
+    mix1 = PreparedVHAPostMix(
+        u_full[half:], v_full[half:], tokens=rows, head_dim=head_dim, world=1,
+        gather_runtime=None, coordinator=None, session=None, name="vha1",
+    )
+    mix0.world = mix1.world = 2
+
+    def make_gather(rank_id, peer_tensor):
+        def gather(local_bf16):
+            return torch.cat((local_bf16, peer_tensor), dim=-1) if rank_id == 0 else torch.cat((peer_tensor, local_bf16), dim=-1)
+        return gather
+
+    z0 = torch.bmm(u_full[:half].float().t().expand(rows, -1, -1), o_full[:, :half].float())
+    z1 = torch.bmm(u_full[half:].float().t().expand(rows, -1, -1), o_full[:, half:].float())
+    z0_bf16 = z0.contiguous().view(torch.bfloat16).view(rows, 2 * rank * head_dim)
+    z1_bf16 = z1.contiguous().view(torch.bfloat16).view(rows, 2 * rank * head_dim)
+
+    out0 = mix0._mix_chunk(o_full[:, :half], make_gather(0, z1_bf16))
+    out1 = mix1._mix_chunk(o_full[:, half:], make_gather(1, z0_bf16))
+    torch.testing.assert_close(torch.cat((out0, out1), dim=1), out_ref, rtol=1e-2, atol=1e-2)

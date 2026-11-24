@@ -30,6 +30,7 @@ from hyperflare_recipes.components.linear import QuantizedProjection, Unquantize
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from hyperflare_recipes.components.rotary import PreparedRotaryAngles
 from hyperflare_recipes.components.situ import sigmoid_gate
+from hyperflare_recipes.components.sparse_mla import PreparedSparseMLA
 from hyperflare_recipes.components.window_indices import PreparedWindowIndices
 
 from .config import Compressor, HCA_LAYER_RATIO
@@ -454,7 +455,7 @@ class PreparedVHAPostMix:
         u_t = self.u.float().t().expand(rows, -1, -1)
         z_local = torch.bmm(u_t, o.float())  # [rows, 16, D] FP32
         if gather_op is not None:
-            flat_bf16 = z_local.contiguous().view(rows, 2 * self.rank * self.head_dim).view(torch.bfloat16)
+            flat_bf16 = z_local.contiguous().view(torch.bfloat16).view(rows, 2 * self.rank * self.head_dim)
             gathered = gather_op(flat_bf16).view(rows, self.world, self.rank, self.head_dim * 2)
             # Reinterpret BF16 pairs back to FP32 and sum across ranks.
             z = gathered.contiguous().view(torch.float32).view(rows, self.world, self.rank, self.head_dim).sum(dim=1)

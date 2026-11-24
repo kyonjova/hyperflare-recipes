@@ -132,6 +132,7 @@ class ModelWeights:
     layers: tuple[LayerWeights, ...]
     draft: DSparkWeights | None
     allocated_bytes: int
+    scale_scratch: tuple[torch.Tensor, ...] | None = None
 
     @classmethod
     def load(
@@ -192,6 +193,7 @@ class ModelWeights:
             layers=layers,
             draft=draft,
             allocated_bytes=allocated_tensor_bytes(device) - before,
+            scale_scratch=loader.scale_scratch,
         )
 
 
@@ -235,12 +237,29 @@ class Ernie55WeightLoader(BlockFP8WeightLoader):
         self.force_moe_decode_a16 = bool(force_moe_decode_a16)
         self.expert_scale_compression = expert_scale_compression
         self.enable_flashindexer = bool(enable_flashindexer)
-        self._expert_scale_scratch = {}
+        self.scale_scratch = None
         self._flashindexer = (
             _load_flashindexer_tensors(manifest.metadata_path, device)
             if self.enable_flashindexer
             else {}
         )
+
+    def _expert_scale_scratch(self, count: int, hidden: int, local: int):
+        if self.expert_scale_compression is None:
+            return None
+        if self.scale_scratch is None:
+            def buffer(rows, columns):
+                return torch.empty(
+                    (count, (rows + 255) // 256 * 256, (columns + 7) // 8 * 8),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+
+            self.scale_scratch = (
+                buffer(2 * local, hidden // 32),
+                buffer(hidden, local // 32),
+            )
+        return self.scale_scratch
 
     def _selected_names(self):
         return {
@@ -428,6 +447,10 @@ class Ernie55WeightLoader(BlockFP8WeightLoader):
         fc2_latent = self.load_linear(moe + ".fc2_latent_proj", columns=latent_interval)
 
         activation_mode = "a16" if self.force_moe_decode_a16 else "a8"
+        local_inter = inter_interval[1] - inter_interval[0]
+        scale_scratch = self._expert_scale_scratch(
+            text["n_routed_experts"], latent_size, local_inter
+        )
         experts = self.load_fp4_experts(
             [f"{moe}.experts.{i}" for i in range(text["n_routed_experts"])],
             hidden_size=latent_size,
@@ -436,11 +459,11 @@ class Ernie55WeightLoader(BlockFP8WeightLoader):
             activation_mode=activation_mode,
             intermediate_range=inter_interval,
             scale_compression=self.expert_scale_compression,
-            scale_scratch=self._expert_scale_scratch,
-            projection_names=("w3", "w1", "w2"),
+            scale_scratch=scale_scratch,
+            projection_names=("w1", "w3", "w2"),
             scale_name="weight_scale_inv",
             activation="situ",
-            w13_layout="w13",
+            w13_layout="w31",
         )
         shared = MLPWeights(
             self.load_linear_group(
