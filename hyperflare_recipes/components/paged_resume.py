@@ -32,9 +32,11 @@ class PreparedResume:
         activation_mode="a16",
         logits_dtype=torch.bfloat16,
         workspace=None,
+        postprocess_logits=None,
     ):
         if logits_dtype not in (torch.bfloat16, torch.float32):
             raise ValueError("resume logits require BF16 or FP32 storage")
+        self.postprocess_logits = postprocess_logits
         self.state = PreparedResumeState(
             requests,
             pool.last_hidden,
@@ -93,4 +95,6 @@ class PreparedResume:
         totals = self.validation(validation)
         hidden = self.state.gather(totals, present=present)
         logits = self.projection(hidden)
+        if self.postprocess_logits is not None:
+            logits = self.postprocess_logits(logits)
         self.completion.run(logits)

@@ -1,0 +1,195 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+SPDX-License-Identifier: Apache-2.0 #}
+{%- set ns = namespace(
+    segments=[],
+    mark_barrier=true,
+    image_count=0,
+    video_count=0,
+    audio_count=0,
+    last_rendered=-1
+) -%}
+{%- macro emit(text, special=false) -%}
+    {%- set s = text | string -%}
+    {%- if s -%}
+        {%- if not ns.mark_barrier and ns.segments | length > 0 and ns.segments[-1].allow_special == special -%}
+            {%- set prev = ns.segments[-1] -%}
+            {%- set ns.segments = ns.segments[:-1] + [{'text': prev.text + s, 'allow_special': special}] -%}
+        {%- else -%}
+            {%- set ns.segments = ns.segments + [{'text': s, 'allow_special': special}] -%}
+            {%- set ns.mark_barrier = false -%}
+        {%- endif -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro render_content(value, role='user', has_reasoning=false) -%}
+    {%- if value is string -%}
+        {{- emit(value) -}}
+    {%- elif value is sequence -%}
+        {%- for item in value -%}
+            {%- if item is mapping -%}
+                {%- set kind = item.type | default('') -%}
+                {%- if kind == 'text' -%}
+                    {%- if 'text' in item -%}
+                        {{- emit('None' if item.text is none else item.text) -}}
+                    {%- endif -%}
+                {%- elif kind == 'image_url' -%}
+                    {%- set ns.image_count = ns.image_count + 1 -%}
+                    {%- set prefix = ' ' if (role == 'assistant' and has_reasoning) else (' Picture ' + (ns.image_count | string) + ':') -%}
+                    {{- emit(prefix + '<image_start><|image@placeholder|><image_end>', true) -}}
+                {%- elif kind == 'video_url' -%}
+                    {%- set ns.video_count = ns.video_count + 1 -%}
+                    {{- emit(' Video ' + (ns.video_count | string) + ':<video_start><|video@placeholder|><video_end>', true) -}}
+                {%- elif kind == 'audio_url' -%}
+                    {%- set ns.audio_count = ns.audio_count + 1 -%}
+                    {%- if role == 'user' -%}
+                        {{- emit(' Audio ' + (ns.audio_count | string) + ':<audio_start><|audio@placeholder|><audio_end>', true) -}}
+                    {%- elif role == 'assistant' -%}
+                        {{- emit(' <audio_start><|audio@placeholder|><audio_end>', true) -}}
+                    {%- endif -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- if messages is not sequence or messages | length == 0 -%}
+    {{- raise_exception('messages must be a non-empty list of message dictionaries') -}}
+{%- endif -%}
+{%- for m in messages -%}
+    {%- if m.role not in ['system', 'user', 'assistant', 'tool'] -%}
+        {{- raise_exception('Unsupported role: ' + (m.role | string)) -}}
+    {%- endif -%}
+    {%- if m.role in ['user', 'assistant', 'tool'] or (m.role == 'system' and loop.index0 > 0) -%}
+        {%- set ns.last_rendered = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set opts = options if (options is defined and options is mapping) else {} -%}
+{%- set thinking_off = (
+    (opts.thinking_mode is defined and opts.thinking_mode in ['close', 'false'])
+    or (enable_thinking is defined and (enable_thinking is sameas false or enable_thinking == 0 or enable_thinking == 'false'))
+) -%}
+{%- set has_tools = tools is defined and tools is sequence and (tools | length) > 0 -%}
+{%- set sys_settings = system_settings if (system_settings is defined and system_settings) else '' -%}
+{%- set ag_storage = agent_storage if (agent_storage is defined and agent_storage) else '' -%}
+{{- emit('<|ERNIE_MASK|><|ernie:im_start|>system\n', true) -}}
+{%- if messages[0].role == 'system' or sys_settings or ag_storage -%}
+    {{- emit('<ernie:system_setting>', true) -}}
+    {%- if sys_settings -%}
+        {{- emit('\n', true) -}}{{- emit(sys_settings) -}}
+    {%- endif -%}
+    {%- if messages[0].role == 'system' and messages[0].content is defined and messages[0].content is not none -%}
+        {%- if messages[0].content is string or messages[0].content is sequence -%}
+            {{- emit('\n', true) -}}{{- render_content(messages[0].content, 'user', false) -}}
+        {%- endif -%}
+    {%- endif -%}
+    {%- if ag_storage -%}
+        {{- emit('\n【agent storage】记录额外的信息，包含但不限于用户画像、长期记忆内容等。\n', true) -}}
+        {{- emit(ag_storage) -}}
+    {%- endif -%}
+    {{- emit('\n</ernie:system_setting>\n', true) -}}
+{%- endif -%}
+{{- emit('<ernie:global_setting>', true) -}}
+{%- if not thinking_off -%}
+    {%- set effort = reasoning_effort if (reasoning_effort is defined and reasoning_effort is not none) else 'high' -%}
+    {%- if effort not in ['low', 'medium', 'high'] -%}
+        {{- raise_exception("reasoning_effort must be one of ('low', 'medium', 'high')") -}}
+    {%- endif -%}
+    {{- emit('\nreasoning_effort=', true) -}}{{- emit(effort) -}}
+{%- endif -%}
+{%- set parallel_opt = opts.parallel_tool_calls if 'parallel_tool_calls' in opts else (parallel_tool_calls if parallel_tool_calls is defined else true) -%}
+{%- set parallel_off = (parallel_opt is sameas false or parallel_opt == 0 or parallel_opt == 'false') -%}
+{%- if not parallel_off and has_tools -%}
+    {{- emit('\nparallel_tool_calls=True', true) -}}
+{%- endif -%}
+{{- emit('\n</ernie:global_setting>', true) -}}
+{%- if has_tools -%}
+    {{- emit('\n<ernie:tool_list>\n[', true) -}}
+    {%- for tool in tools -%}
+        {%- if not loop.first -%}{{- emit(', ') -}}{%- endif -%}
+        {{- emit(tool | tojson(ensure_ascii=false, sort_keys=true, separators=(', ', ': '))) -}}
+    {%- endfor -%}
+    {{- emit(']\n</ernie:tool_list>', true) -}}
+{%- endif -%}
+{{- emit('<|ernie:im_end|>\n', true) -}}
+{%- mark ns.segments | length -%}{%- set ns.mark_barrier = true -%}
+{%- for m in messages -%}
+    {%- set role = m.role -%}
+    {%- set is_last = loop.index0 == ns.last_rendered -%}
+    {%- if role == 'system' and loop.index0 == 0 -%}
+        {# Preserve media counter side effects for leading system message without emitting twice. #}
+        {%- if m.content is sequence and m.content is not string -%}
+            {%- for item in m.content -%}
+                {%- if item is mapping -%}
+                    {%- if item.type == 'image_url' -%}{%- set ns.image_count = ns.image_count + 1 -%}
+                    {%- elif item.type == 'video_url' -%}{%- set ns.video_count = ns.video_count + 1 -%}
+                    {%- elif item.type == 'audio_url' -%}{%- set ns.audio_count = ns.audio_count + 1 -%}
+                    {%- endif -%}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+    {%- elif role == 'user' or (role == 'system' and loop.index0 > 0) -%}
+        {{- emit('<|ernie:im_start|>' + role + '\n', true) -}}
+        {{- render_content(m.content, role, 'reasoning_content' in m) -}}
+        {{- emit('<|ernie:im_end|>' + ('' if is_last else '\n'), true) -}}
+        {%- mark ns.segments | length -%}{%- set ns.mark_barrier = true -%}
+    {%- elif role == 'assistant' -%}
+        {{- emit('<|ernie:im_start|>assistant\n', true) -}}
+        {%- set rns = namespace(has_explicit=false, reasoning='', body=m.content) -%}
+        {%- if m.thoughts is defined and m.thoughts is string -%}
+            {%- set rns.has_explicit = true -%}
+            {%- set rns.reasoning = m.thoughts -%}
+        {%- elif m.reasoning_content is defined and m.reasoning_content is string -%}
+            {%- set rns.has_explicit = true -%}
+            {%- set rns.reasoning = m.reasoning_content -%}
+        {%- elif m.content is string and '</ernie:think>' in m.content -%}
+            {%- set parts = m.content.split('</ernie:think>') -%}
+            {%- set head = parts[0] -%}
+            {%- if '<ernie:think>' in head -%}
+                {%- set rns.reasoning = head.split('<ernie:think>')[-1] -%}
+            {%- else -%}
+                {%- set rns.reasoning = head -%}
+            {%- endif -%}
+            {%- set rns.body = parts[-1] -%}
+        {%- endif -%}
+        {{- emit('<ernie:think>', true) -}}
+        {%- if not thinking_off and (rns.reasoning | trim) -%}
+            {{- emit(rns.reasoning) -}}
+        {%- endif -%}
+        {{- emit('</ernie:think>', true) -}}
+        {{- render_content(rns.body, 'assistant', 'reasoning_content' in m) -}}
+        {%- if m.tool_calls is defined and m.tool_calls -%}
+            {{- emit('<ernie:tool_call>\n', true) -}}
+            {%- for call in m.tool_calls -%}
+                {%- set fn = call.function | default(call) -%}
+                {{- emit('<invoke name="', true) -}}{{- emit(fn.name) -}}{{- emit('">', true) -}}
+                {%- set args = fn.arguments | default({}, true) -%}
+                {%- if args is not mapping -%}
+                    {{- raise_exception('tool call arguments must be a JSON object') -}}
+                {%- endif -%}
+                {%- for key, val in args | dictsort -%}
+                    {{- emit('<parameter name="', true) -}}{{- emit(key) -}}{{- emit('">', true) -}}
+                    {{- emit(val if val is string else (val | tojson(ensure_ascii=false, sort_keys=true, separators=(', ', ': ')))) -}}
+                    {{- emit('</parameter>', true) -}}
+                {%- endfor -%}
+                {{- emit('</invoke>\n', true) -}}
+            {%- endfor -%}
+            {{- emit('</ernie:tool_call>', true) -}}
+        {%- endif -%}
+        {{- emit('<|ernie:im_end|>' + ('' if is_last else '\n'), true) -}}
+        {%- mark ns.segments | length -%}{%- set ns.mark_barrier = true -%}
+    {%- elif role == 'tool' -%}
+        {%- if loop.first or messages[loop.index0 - 1].role != 'tool' -%}
+            {{- emit('<|ernie:im_start|>tool', true) -}}
+        {%- endif -%}
+        {{- emit('\n<ernie:tool_output>', true) -}}
+        {{- render_content(m.content, 'tool', 'reasoning_content' in m) -}}
+        {{- emit('</ernie:tool_output>', true) -}}
+        {%- if loop.last or messages[loop.index0 + 1].role != 'tool' -%}
+            {{- emit('<|ernie:im_end|>' + ('' if is_last else '\n'), true) -}}
+            {%- mark ns.segments | length -%}{%- set ns.mark_barrier = true -%}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt is not defined or add_generation_prompt -%}
+    {{- emit('\n<|ernie:im_start|>assistant\n', true) -}}
+    {{- emit('<ernie:think></ernie:think>' if thinking_off else '<ernie:think>', true) -}}
+{%- endif -%}
+{{- ns.segments | tojson(ensure_ascii=false) -}}

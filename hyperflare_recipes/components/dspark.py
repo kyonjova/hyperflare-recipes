@@ -204,14 +204,15 @@ class PreparedMarkov:
             (rows, weights.config.draft.markov_rank), dtype=torch.bfloat16, device=device
         )
         head = weights.draft.markov_head
+        vocabulary = getattr(weights.config, "vocabulary", None) or weights.config.text["vocab_size"]
         columns = head.shape[0] if isinstance(head, torch.Tensor) else head.out_features
-        expected_columns = 129280 if runtime is None else 129280 // weights.shard.world_size
+        expected_columns = vocabulary if runtime is None else vocabulary // weights.shard.world_size
         if columns != expected_columns:
             raise ValueError("Markov head vocabulary partition must match its gather runtime")
         local = torch.zeros((rows, columns), dtype=torch.float32, device=device)
         projected = local if isinstance(head, (torch.Tensor, RowScaledFP8MarkovWeight)) else torch.empty(
             (rows, columns), dtype=torch.bfloat16, device=device)
-        logits = local if runtime is None else torch.zeros((rows, 129280), dtype=torch.float32, device=device)
+        logits = local if runtime is None else torch.zeros((rows, vocabulary), dtype=torch.float32, device=device)
         self.embed = PreparedEmbedding(
             weights.draft.markov_embedding, tokens, embedding, session=session, name=name + ".embed"
         ).functional(session=session, dynamic_inputs=True)
