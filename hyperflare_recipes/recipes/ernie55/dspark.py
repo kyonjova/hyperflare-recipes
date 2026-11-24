@@ -90,6 +90,7 @@ class PreparedDraft:
                 pool,
                 rotary,
                 shard=weights.shard,
+                latent_begin=weights.latent_begin,
                 mode="draft",
                 runtime=runtime,
                 latent_runtime=latent_runtime,

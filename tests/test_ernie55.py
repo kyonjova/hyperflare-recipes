@@ -273,8 +273,8 @@ def test_moe_split_routing_and_rms_norm_columns():
     full = (x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6) * w.float()).to(
         torch.bfloat16
     )
-    left = rms_norm_columns(x, w, col_start=0, col_width=1024, eps=1e-6)
-    right = rms_norm_columns(x, w, col_start=1024, col_width=1024, eps=1e-6)
+    left = rms_norm_columns(x, w, col_start=torch.tensor([0], dtype=torch.int32), col_width=1024, eps=1e-6)
+    right = rms_norm_columns(x, w, col_start=torch.tensor([1024], dtype=torch.int32), col_width=1024, eps=1e-6)
     assert torch.equal(torch.cat((left, right), dim=-1), full)
 
 

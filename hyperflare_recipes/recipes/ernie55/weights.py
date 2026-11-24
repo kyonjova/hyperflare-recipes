@@ -133,6 +133,7 @@ class ModelWeights:
     draft: DSparkWeights | None
     allocated_bytes: int
     scale_scratch: tuple[torch.Tensor, ...] | None = None
+    latent_begin: torch.Tensor | None = None
 
     @classmethod
     def load(
@@ -181,6 +182,8 @@ class ModelWeights:
                     draft = replace(draft, draft_head=nvfp4_draft_head(head))
                 if markov_head_quantization == "nvfp4":
                     draft = replace(draft, markov_head=nvfp4_draft_head(draft.markov_head))
+        latent_start = shard.partition(config.text["moe_latent_size"], alignment=128)[0]
+        latent_begin = persistent_copy(torch.tensor([latent_start], dtype=torch.int32, device=device))
         return cls(
             config=config,
             shard=shard,
@@ -194,6 +197,7 @@ class ModelWeights:
             draft=draft,
             allocated_bytes=allocated_tensor_bytes(device) - before,
             scale_scratch=loader.scale_scratch,
+            latent_begin=latent_begin,
         )
 
 

@@ -39,24 +39,25 @@ def _ernie55_split_sigmoid_kernel(
 def _rms_norm_columns_kernel(
     x_ptr,
     w_ptr,
+    col_start_ptr,
     out_ptr,
     rows,
     x_stride,
     out_stride,
     eps,
     DIM: tl.constexpr,
-    COL_START: tl.constexpr,
     COL_WIDTH: tl.constexpr,
 ):
-    """Full-row RMSNorm(2048) writing only the local TP slice `[COL_START : COL_START + COL_WIDTH]`."""
+    """Full-row RMSNorm(2048) writing only the rank-local TP slice `[col_start : col_start + COL_WIDTH]`."""
     row = tl.program_id(0).to(tl.int64)
     if row >= rows:
         return
     full = tl.arange(0, DIM)
     x_full = tl.load(x_ptr + row * x_stride + full).to(tl.float32)
     inv_rms = tl.rsqrt(tl.sum(x_full * x_full, axis=0) * (1.0 / DIM) + eps)
+    col_start = tl.load(col_start_ptr).to(tl.int64)
     cols = tl.arange(0, COL_WIDTH)
-    src_cols = COL_START + cols
+    src_cols = col_start + cols
     x_slice = tl.load(x_ptr + row * x_stride + src_cols).to(tl.float32)
     w_slice = tl.load(w_ptr + src_cols).to(tl.float32)
     tl.store(out_ptr + row * out_stride + cols, (x_slice * inv_rms * w_slice).to(tl.bfloat16))
@@ -66,7 +67,7 @@ def rms_norm_columns(
     x: torch.Tensor,
     weight: torch.Tensor,
     *,
-    col_start: int,
+    col_start: int | torch.Tensor,
     col_width: int,
     eps: float = 1e-6,
     out: torch.Tensor | None = None,
@@ -78,23 +79,29 @@ def rms_norm_columns(
     if rows == 0:
         return out
     if x.is_cuda and x.dtype == torch.bfloat16 and dim == 2048 and col_width in (256, 512, 1024, 2048):
+        start_tensor = (
+            col_start
+            if isinstance(col_start, torch.Tensor)
+            else torch.tensor([int(col_start)], dtype=torch.int32, device=x.device)
+        )
         torch.library.wrap_triton(_rms_norm_columns_kernel)[(rows,)](
             x,
             weight,
+            start_tensor,
             out,
             rows,
             x.stride(0),
             out.stride(0),
             float(eps),
             DIM=dim,
-            COL_START=col_start,
             COL_WIDTH=col_width,
             num_warps=4,
         )
         return out
+    start = int(col_start.item()) if isinstance(col_start, torch.Tensor) else int(col_start)
     xf = x.float()
     inv_rms = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + float(eps))
-    sliced = xf[:, col_start : col_start + col_width] * inv_rms * weight[col_start : col_start + col_width].float()
+    sliced = xf[:, start : start + col_width] * inv_rms * weight[start : start + col_width].float()
     out.copy_(sliced.to(x.dtype))
     return out
 
@@ -196,6 +203,7 @@ class PreparedLatentMoE:
         scratch: LatentMoEScratch,
         *,
         shard,
+        latent_begin: torch.Tensor | None = None,
         eps: float,
         beta: float,
         linear_beta: float,
@@ -211,8 +219,17 @@ class PreparedLatentMoE:
         self.weights = weights
         self.eps = float(eps)
         self.top_k = int(top_k)
-        self.latent_start, self.latent_end = shard.partition(2048, alignment=128)
-        self.latent_width = self.latent_end - self.latent_start
+        latent_start, latent_end = shard.partition(2048, alignment=128)
+        self.latent_width = latent_end - latent_start
+        # Compiled forwards are shared across ranks, so store the rank-local column offset
+        # as a persistent 1-element device tensor rather than a guarded Python int.
+        if latent_begin is None:
+            from ignition.preparation.persistent import persistent_copy
+
+            latent_begin = persistent_copy(
+                torch.tensor([latent_start], dtype=torch.int32, device=source.device)
+            )
+        self.latent_begin = latent_begin
 
         # Fused split-feature router: two [E, H] routers stacked as [2*E, H] FP32 -> [T, 2*E] FP32.
         self.router_proj = UnquantizedProjection(
@@ -307,7 +324,7 @@ class PreparedLatentMoE:
         normed_slice = rms_norm_columns(
             routed_latent,
             self.weights.latent_norm,
-            col_start=self.latent_start,
+            col_start=self.latent_begin,
             col_width=self.latent_width,
             eps=self.eps,
         )
