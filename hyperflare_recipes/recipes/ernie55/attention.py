@@ -36,7 +36,8 @@ from hyperflare_recipes.components.window_indices import PreparedWindowIndices
 from .config import Compressor, HCA_LAYER_RATIO
 from .pool import DSA_RECORD_BYTES, INDEX_SUBPAGE_TOKENS, PAGE_TOKENS, hca_latent_page_bytes
 
-INDEX_ROWS = 4096
+INDEX_ROWS = 2048
+DSA_ATTN_CHUNK_ROWS = 512
 SHARED_ROTARY_ROWS = 32
 VHA_RANK = 16
 VHA_CHUNK_ROWS = 256
@@ -410,6 +411,7 @@ class PreparedVHAPostMix:
         coordinator,
         session,
         name: str,
+        examples=None,
     ):
         self.u = u
         self.v = v
@@ -422,9 +424,14 @@ class PreparedVHAPostMix:
             device = u.device
             # FP32 [chunk, 16, D] viewed as BF16 [chunk, 32 * D].
             local_cols = 2 * self.rank * self.head_dim
-            local_buf = torch.empty((self.chunk_rows, local_cols), dtype=torch.bfloat16, device=device)
-            gathered_buf = torch.empty(
-                (self.chunk_rows, self.world * local_cols), dtype=torch.bfloat16, device=device
+            def alloc(role, shape):
+                if examples is not None:
+                    return declaration_tensor(examples, role, shape, torch.bfloat16, device)
+                return torch.empty(shape, dtype=torch.bfloat16, device=device)
+
+            local_buf = alloc(f"vha.local.{self.head_dim}", (self.chunk_rows, local_cols))
+            gathered_buf = alloc(
+                f"vha.gathered.{self.head_dim}", (self.chunk_rows, self.world * local_cols)
             )
             self.gather = PreparedAllGather(
                 local_buf,
@@ -437,9 +444,9 @@ class PreparedVHAPostMix:
             self.tail_rows = tokens % self.chunk_rows
             self.tail_gather = None
             if self.tail_rows:
-                tail_local = torch.empty((self.tail_rows, local_cols), dtype=torch.bfloat16, device=device)
-                tail_gathered = torch.empty(
-                    (self.tail_rows, self.world * local_cols), dtype=torch.bfloat16, device=device
+                tail_local = alloc(f"vha.tail_local.{self.head_dim}", (self.tail_rows, local_cols))
+                tail_gathered = alloc(
+                    f"vha.tail_gathered.{self.head_dim}", (self.tail_rows, self.world * local_cols)
                 )
                 self.tail_gather = PreparedAllGather(
                     tail_local,
@@ -554,7 +561,7 @@ class AttentionGeometry(NamedTuple):
 class AttentionIndices(PreparedWindowIndices):
     """Shared window, C128 compression, rotary, and DSA slot/length geometry per invocation."""
 
-    def __init__(self, metadata, *, mode: str, tokens: int, has_dsa: bool = True):
+    def __init__(self, metadata, *, mode: str, tokens: int, has_dsa: bool = True, examples=None):
         page_size = 128 if mode == "decode" else 128 + metadata.max_query_tokens
         width = page_size if mode == "draft" else 128
         super().__init__(metadata, mode=mode, tokens=tokens, page_size=page_size, width=width, visible=None)
@@ -569,10 +576,11 @@ class AttentionIndices(PreparedWindowIndices):
             self.dsa_indexer_lengths = torch.zeros((tokens,), dtype=torch.int32, device=device)
             self.dsa_active_width = torch.zeros((1,), dtype=torch.int32, device=device)
             # 256-token model pages expand to 4x 64-token subpages for FP8 indexer.
-            self.dsa_subpage_table = torch.zeros(
-                (tokens, metadata.page_table.shape[1] * (PAGE_TOKENS // INDEX_SUBPAGE_TOKENS)),
-                dtype=torch.int32,
-                device=device,
+            subpage_shape = (tokens, metadata.page_table.shape[1] * (PAGE_TOKENS // INDEX_SUBPAGE_TOKENS))
+            self.dsa_subpage_table = (
+                declaration_tensor(examples, "attention.dsa_subpage_table", subpage_shape, torch.int32, device)
+                if examples is not None
+                else torch.zeros(subpage_shape, dtype=torch.int32, device=device)
             )
         else:
             self.dsa_slots = self.dsa_cache_lengths = self.dsa_indexer_lengths = None
@@ -789,15 +797,29 @@ class PreparedHCAAttention:
             example_role="attention.hca_gate",
         ).functional(session=session)
 
+        o_group_in = (
+            declaration_tensor(examples, "attention.hca_o_group_in", (tokens, 4096), torch.bfloat16, device)
+            if examples is not None
+            else torch.empty((tokens, 4096), dtype=torch.bfloat16, device=device)
+        )
+        o_group_out = (
+            declaration_tensor(
+                examples, "attention.hca_o_group_out", (tokens, self.o_lora_rank), torch.bfloat16, device
+            )
+            if examples is not None
+            else torch.empty((tokens, self.o_lora_rank), dtype=torch.bfloat16, device=device)
+        )
         self.o_group = tuple(
             QuantizedProjection(
-                scratch.hca_attended.view(tokens, self.local_groups, 4096)[:, g, :].contiguous(),
+                o_group_in,
                 weights["o_group"][g],
-                scratch.hca_grouped[:, g * self.o_lora_rank : (g + 1) * self.o_lora_rank].contiguous(),
+                o_group_out,
                 session=session,
                 name=f"{name}.o_group{g}",
                 workspace=workspace,
                 activation_mode="auto",
+                examples=examples,
+                example_role="attention.hca_o_group",
             ).functional(session=session)
             for g in range(self.local_groups)
         )
@@ -823,6 +845,7 @@ class PreparedHCAAttention:
             coordinator=coordinator,
             session=session,
             name=name + ".vha",
+            examples=examples,
         )
 
         self.window_writer = PreparedCompressedCacheWriter(
@@ -1173,41 +1196,51 @@ class PreparedDSAAttention:
                     head_weight_scale=64**-0.5 if self.use_flashindexer else None,
                     hadamard=True,
                     key_power_of_two=True,
-                    prefill_records_per_call=131072,
+                    prefill_records_per_call=32768,
                     examples=examples,
                     example_role=f"attention.dsa_indexer_{idx_heads}",
                 ).functional(session=session)
             )
 
-        caps = sparse_mla.Caps(
-            device=device,
-            num_q_heads=self.heads,
-            max_q_rows=tokens,
-            max_width=DSA_MERGED_WIDTH,
-            softmax_scale=256**-0.5,
-            dtype=torch.bfloat16,
-            kv_dtype=torch.uint8,
-            head_dim=576,
-            v_head_dim=512,
-            model_type=int(sparse_mla.ModelType.GLM_NSA),
-            scale_format=int(ScaleFormat.ARBITRARY_FP32),
-            mode="decode",
-            page_size=INDEX_SUBPAGE_TOKENS,
-            has_attention_sink=True,
-        )
-        self.attention = PreparedSparseMLA(
-            scratch.dsa_absorbed,
-            self.latent_cache,
-            scratch.dsa_physical,
-            indices.dsa_cache_lengths,
-            scratch.dsa_selected_lengths,
-            scratch.dsa_attended_latent,
-            caps=caps,
-            session=session,
-            name=name + ".sparse_mla",
-            workspace=workspace,
-            attention_sink=weights["sink"],
-        ).functional(session=session)
+        # Bound sparse-MLA split-KV scratch by chunking prefill rows and capping chunks per row:
+        # 2176 / 64 = 34 max KV tiles; 512-row prefill chunks with 4 splits saturate GB10 in ~64 MiB.
+        self.attentions = []
+        for first in range(0, tokens, DSA_ATTN_CHUNK_ROWS):
+            last = min(tokens, first + DSA_ATTN_CHUNK_ROWS)
+            chunk_rows = last - first
+            max_chunks = 34 if chunk_rows <= 32 else (16 if chunk_rows <= 128 else 4)
+            caps = sparse_mla.Caps(
+                device=device,
+                num_q_heads=self.heads,
+                max_q_rows=chunk_rows,
+                max_width=DSA_MERGED_WIDTH,
+                softmax_scale=256**-0.5,
+                dtype=torch.bfloat16,
+                kv_dtype=torch.uint8,
+                head_dim=576,
+                v_head_dim=512,
+                model_type=int(sparse_mla.ModelType.GLM_NSA),
+                scale_format=int(ScaleFormat.ARBITRARY_FP32),
+                mode="decode",
+                page_size=INDEX_SUBPAGE_TOKENS,
+                max_chunks_per_row=max_chunks,
+                has_attention_sink=True,
+            )
+            self.attentions.append(
+                PreparedSparseMLA(
+                    scratch.dsa_absorbed[first:last],
+                    self.latent_cache,
+                    scratch.dsa_physical[first:last],
+                    indices.dsa_cache_lengths[first:last],
+                    scratch.dsa_selected_lengths[first:last],
+                    scratch.dsa_attended_latent[first:last],
+                    caps=caps,
+                    session=session,
+                    name=f"{name}.sparse_mla{first}",
+                    workspace=workspace,
+                    attention_sink=weights["sink"],
+                ).functional(session=session)
+            )
 
         self.vha = PreparedVHAPostMix(
             weights["vha_u"],
@@ -1219,6 +1252,7 @@ class PreparedDSAAttention:
             coordinator=coordinator,
             session=session,
             name=name + ".vha",
+            examples=examples,
         )
 
     def __call__(self, source: torch.Tensor, metadata, indices: AttentionGeometry):
@@ -1291,9 +1325,25 @@ class PreparedDSAAttention:
         q_nope_abs = torch.bmm(q[:, :, :192].transpose(0, 1), self.w_uk).transpose(0, 1)
         q_absorbed = torch.cat((q_nope_abs, q[:, :, 192:]), dim=-1).contiguous()
 
-        attended_latent = self.attention(
-            q_absorbed, physical, indices.dsa_cache_lengths, selected_lengths
-        )
+        if len(self.attentions) == 1:
+            attended_latent = self.attentions[0](
+                q_absorbed, physical, indices.dsa_cache_lengths, selected_lengths
+            )
+        else:
+            attended_latent = torch.cat(
+                [
+                    attn(
+                        q_absorbed[first : first + DSA_ATTN_CHUNK_ROWS],
+                        physical[first : first + DSA_ATTN_CHUNK_ROWS],
+                        indices.dsa_cache_lengths[first : first + DSA_ATTN_CHUNK_ROWS],
+                        selected_lengths[first : first + DSA_ATTN_CHUNK_ROWS],
+                    )
+                    for first, attn in zip(
+                        range(0, tokens, DSA_ATTN_CHUNK_ROWS), self.attentions, strict=True
+                    )
+                ],
+                dim=0,
+            )
         # Expand latent [T, H_local, 512] via W_uv [H_local, 512, 256] -> [T, H_local, 256].
         attended = torch.bmm(attended_latent.transpose(0, 1), self.w_uv).transpose(0, 1).contiguous()
         attended = self.vha(attended)

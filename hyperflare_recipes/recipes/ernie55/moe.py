@@ -206,6 +206,7 @@ class PreparedLatentMoE:
         session,
         name: str,
         workspace,
+        examples=None,
     ):
         self.weights = weights
         self.eps = float(eps)
@@ -230,6 +231,8 @@ class PreparedLatentMoE:
             name=name + ".fc1_latent",
             workspace=workspace,
             activation_mode="auto",
+            examples=examples,
+            example_role="moe.fc1_latent",
         ).functional(session=session)
 
         self.experts = PreparedRoutedExperts(
@@ -260,6 +263,8 @@ class PreparedLatentMoE:
             name=name + ".fc2_latent",
             workspace=workspace,
             activation_mode="auto",
+            examples=examples,
+            example_role="moe.fc2_latent",
         ).functional(session=session)
 
         self.shared = PreparedSiTUMLP(
@@ -274,6 +279,8 @@ class PreparedLatentMoE:
             beta=beta,
             linear_beta=linear_beta,
             activation_mode="auto",
+            examples=examples,
+            example_role="moe.shared",
         ).functional(session=session)
 
         self.hidden_reduce = PreparedAllReduce(

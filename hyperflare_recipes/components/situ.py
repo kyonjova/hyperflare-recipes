@@ -165,6 +165,8 @@ class PreparedSiTUMLP:
         activation_mode="auto",
         gate_up_bias=None,
         down_bias=None,
+        examples=None,
+        example_role=None,
     ):
         self.gate_up, self.intermediate, self.output = gate_up, intermediate, output
         self.beta, self.linear_beta = float(beta), float(linear_beta)
@@ -208,6 +210,8 @@ class PreparedSiTUMLP:
                 workspace=workspace,
                 activation_mode=activation_mode,
                 bias=bias,
+                examples=examples,
+                example_role=None if example_role is None else f"{example_role}.{suffix}",
             )
 
         self.up_projection = projection(source, weights.gate_up, gate_up, "gate_up", gate_up_bias)

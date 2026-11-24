@@ -230,6 +230,8 @@ class PreparedLayer:
                 beta=cfg.situ_beta,
                 linear_beta=cfg.situ_linear_beta,
                 activation_mode="auto",
+                examples=examples,
+                example_role="mlp.dense",
             ).functional(session=session)
             self.dense_reduce = PreparedAllReduce(
                 s.dense_mlp.output,
@@ -255,6 +257,7 @@ class PreparedLayer:
                 session=session,
                 name=name + ".moe",
                 workspace=workspace,
+                examples=examples,
             )
 
         self.post = (
@@ -344,7 +347,7 @@ class PreparedDecoder:
         ).functional(session=session, dynamic_inputs=True)
         self.rotary = Rotary(weights.config, scratch.embedding.device)
         self.indices = AttentionIndices(
-            metadata, mode=mode, tokens=metadata.token_ids.numel(), has_dsa=True
+            metadata, mode=mode, tokens=metadata.token_ids.numel(), has_dsa=True, examples=examples
         )
         self.layers, carry = [], False
         for index, layer in enumerate(weights.layers):
