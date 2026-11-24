@@ -382,8 +382,13 @@ class Ernie55WeightLoader(BlockFP8WeightLoader):
         wproj = self.load_tensor(idx + ".weights_proj.weight", temporary=True)
         index_kw = persistent_cat((wk, wproj), dim=0)
 
+        kv_a_padded = ((kv_lora + qk_rope + self.block_size - 1) // self.block_size) * self.block_size
         attention = {
-            "qkv_a": self.load_linear_group((attn + ".q_a_proj", attn + ".kv_a_proj_with_mqa")),
+            "qkv_a": self.load_linear_group(
+                (attn + ".q_a_proj", attn + ".kv_a_proj_with_mqa"),
+                row_ranges=(None, (0, kv_a_padded)),
+                pad=True,
+            ),
             "q_b": self.load_linear(attn + ".q_b_proj", rows=q_rows),
             "q_norm": self.load_tensor(attn + ".q_a_layernorm.weight"),
             "kv_norm": self.load_tensor(attn + ".kv_a_layernorm.weight"),

@@ -485,3 +485,27 @@ def test_csf_scale_scratch_and_vha_tp_mix_and_sparse_mla_import():
     out0 = mix0._mix_chunk(o_full[:, :half], make_gather(0, z1_bf16))
     out1 = mix1._mix_chunk(o_full[:, half:], make_gather(1, z0_bf16))
     torch.testing.assert_close(torch.cat((out0, out1), dim=1), out_ref, rtol=1e-2, atol=1e-2)
+
+
+def test_dsa_kv_a_576_padded_block_fp8_loading():
+    from hyperflare_recipes.recipes.ernie55.weights import Ernie55WeightLoader
+
+    loader = Ernie55WeightLoader.__new__(Ernie55WeightLoader)
+    loader.device = torch.device("cpu")
+    loader.config = ModelConfig.from_dict(_sample_config_dict())
+    loader._session = type("_S", (), {"flush": lambda self: None})()
+    loader._require_open = lambda: None
+    loader._copy = lambda dst, src: dst.copy_(src)
+    w = torch.randn(576, 4096).to(torch.float8_e4m3fn)
+    # 5 scale rows for ceil(576 / 128) = 5, 32 cols for 4096 / 128.
+    s = torch.full((5, 32), 1.0, dtype=torch.float32)
+    loader._sources = {
+        "m.kv_a_proj_with_mqa.weight": w,
+        "m.kv_a_proj_with_mqa.weight_scale_inv": s,
+    }
+    vals, scales = loader._dense_blocks("m.kv_a_proj_with_mqa", rows=(0, 640), pad=True)
+    assert vals.shape == (640, 4096)
+    assert scales.shape == (5, 32)
+    assert torch.equal(vals[:576], w)
+    assert (vals[576:].float() == 0).all()
+    assert (scales == 127).all()

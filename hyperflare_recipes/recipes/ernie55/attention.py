@@ -506,7 +506,8 @@ class AttentionScratch:
         local_groups = 8 // world
         return cls(
             hca_projected=zeros(tokens, 1536),
-            dsa_projected=zeros(tokens, 1600),
+            # q_a_proj (1024) + kv_a_proj_with_mqa (576, zero-padded to 640 for block-128 FP8).
+            dsa_projected=zeros(tokens, 1664),
             query_low=zeros(tokens, 1024),
             hca_query=zeros(tokens, local_heads, 512),
             window_values=zeros(tokens, 512),
