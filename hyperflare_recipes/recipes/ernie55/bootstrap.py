@@ -406,6 +406,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             manifest,
             device,
             shard=shard,
+            group=group,
             progress=progress,
             dspark=config.dspark,
             confidence=config.draft_tokens > 0,
@@ -415,6 +416,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             markov_head_quantization=config.markov_head_quantization,
             vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
         )
+        if torch.cuda.get_device_properties(device).is_integrated:
+            from ignition.preparation.host_memory import release_page_cache
+
+            release_page_cache(manifest.shard_paths)
         release_unused()
     transient = contextlib.ExitStack()
     transient.enter_context(core_storage.transient())

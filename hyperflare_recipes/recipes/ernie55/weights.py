@@ -141,6 +141,7 @@ class ModelWeights:
         device,
         *,
         shard,
+        group=None,
         progress=None,
         dspark=True,
         confidence=False,
@@ -156,6 +157,7 @@ class ModelWeights:
             manifest,
             device,
             shard=shard,
+            group=group,
             progress=progress,
             dspark=dspark,
             expert_scale_compression=expert_scale_compression,
@@ -221,6 +223,7 @@ class ErnieWeightLoader(BlockFP8WeightLoader):
         device,
         *,
         shard,
+        group=None,
         progress=None,
         prefixes=None,
         dspark=True,
@@ -238,25 +241,38 @@ class ErnieWeightLoader(BlockFP8WeightLoader):
         self.config = ModelConfig.load(manifest.metadata_path)
         self.shard = shard
         self._expert_scale_scratch = {}
-        self._flashindexer = self._load_flashindexer_weights(manifest.snapshot)
+        self._flashindexer = self._load_flashindexer_weights(manifest.snapshot, group=group)
 
-    def _load_flashindexer_weights(self, snapshot: Path) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+    def _load_flashindexer_weights(
+        self, snapshot: Path, *, group=None
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
         path = Path(snapshot) / "flashindexer" / "flashindexer.safetensors"
-        if not path.is_file():
+        raw: bytes | None = None
+        if group is not None and self.shard.world_size > 1:
+            if self.shard.rank == 0 and path.is_file():
+                raw = path.read_bytes()
+            payload = [raw]
+            src = torch.distributed.get_process_group_ranks(group)[0]
+            torch.distributed.broadcast_object_list(payload, src=src, group=group)
+            raw = payload[0]
+            if raw is None:
+                return {}
+        elif path.is_file():
+            raw = path.read_bytes()
+        else:
             return {}
-        from safetensors.torch import safe_open
+        from safetensors.torch import load as load_safetensors_bytes
 
+        tensors = load_safetensors_bytes(raw)
         gates = {}
-        with safe_open(str(path), framework="pt", device="cpu") as f:
-            keys = set(f.keys())
-            for layer in self.config.dsa_layers:
-                g_key = f"model.layers.{layer}.self_attn.core_attention.indexer.linear_gate.weight"
-                b_key = f"model.layers.{layer}.self_attn.core_attention.indexer.flashindexer_bias"
-                if g_key not in keys or b_key not in keys:
-                    raise ValueError(f"flashindexer.safetensors missing DSA layer {layer} gate parameters")
-                gate_w = persistent_copy(f.get_tensor(g_key).to(device=self.device, dtype=torch.bfloat16))
-                bias_f = persistent_copy(f.get_tensor(b_key).to(device=self.device, dtype=torch.float32))
-                gates[layer] = (gate_w, bias_f)
+        for layer in self.config.dsa_layers:
+            g_key = f"model.layers.{layer}.self_attn.core_attention.indexer.linear_gate.weight"
+            b_key = f"model.layers.{layer}.self_attn.core_attention.indexer.flashindexer_bias"
+            if g_key not in tensors or b_key not in tensors:
+                raise ValueError(f"flashindexer.safetensors missing DSA layer {layer} gate parameters")
+            gate_w = persistent_copy(tensors[g_key].to(device=self.device, dtype=torch.bfloat16))
+            bias_f = persistent_copy(tensors[b_key].to(device=self.device, dtype=torch.float32))
+            gates[layer] = (gate_w, bias_f)
         return gates
 
     def _selected_names(self):
